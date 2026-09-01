@@ -777,7 +777,17 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
     };
   }
 
-  const cachedNote = connection?.status === "connected" ? "" : " (not connected, cached)";
+  // "not connected" alone reads as an outage while the tools listed below are
+  // real and the connection is simply lazy (tools served from cache).
+  // Distinguish auth from plain laziness so the caller knows which remedy applies.
+  let cachedNote = "";
+  if (connection?.status !== "connected") {
+    if (connection?.status === "needs-auth") {
+      cachedNote = ` (needs auth — run mcp({ action: "auth-start", server: "${server}" }))`;
+    } else {
+      cachedNote = ` (lazy: tools from cache, not connected yet — mcp({ connect: "${server}" }) to connect)`;
+    }
+  }
   let text = `${server} (${toolNames.length} tools${cachedNote}):\n\n`;
 
   const descMap = new Map<string, string>();
