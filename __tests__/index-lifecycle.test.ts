@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolve } from "node:path";
 import { MCP_STATUS_EVENT } from "../types.ts";
 import { ConsentManager } from "../consent-manager.ts";
 import { MCP_APPROVAL_CUSTOM_TYPE, getToolApprovalIdentity, makeToolApprovalKey } from "../session-approvals.ts";
@@ -13,6 +14,8 @@ const mocks = vi.hoisted(() => ({
   shutdownOAuth: vi.fn().mockResolvedValue(undefined),
   loadMcpConfig: vi.fn(() => ({ mcpServers: {} })),
   cloneMcpConfig: vi.fn((config: unknown) => structuredClone(config)),
+  discoverConfiguredClaudePluginSkills: vi.fn(() => []),
+  resolveConfiguredClaudePluginMcp: vi.fn((config: unknown) => structuredClone(config)),
   loadMetadataCache: vi.fn(() => null),
   buildProxyDescription: vi.fn(() => "MCP gateway"),
   createDirectToolExecutor: vi.fn(() => vi.fn()),
@@ -62,6 +65,8 @@ vi.mock("../mcp-auth-flow.ts", () => ({
 vi.mock("../config.ts", () => ({
   loadMcpConfig: mocks.loadMcpConfig,
   cloneMcpConfig: mocks.cloneMcpConfig,
+  discoverConfiguredClaudePluginSkills: mocks.discoverConfiguredClaudePluginSkills,
+  resolveConfiguredClaudePluginMcp: mocks.resolveConfiguredClaudePluginMcp,
   writeProjectServerDisabledOverride: mocks.writeProjectServerDisabledOverride,
 }));
 
@@ -260,6 +265,8 @@ describe("mcpAdapter session lifecycle", () => {
     mocks.shutdownOAuth.mockResolvedValue(undefined);
     mocks.loadMcpConfig.mockReturnValue({ mcpServers: {} });
     mocks.cloneMcpConfig.mockImplementation((config: unknown) => structuredClone(config));
+    mocks.discoverConfiguredClaudePluginSkills.mockReturnValue([]);
+    mocks.resolveConfiguredClaudePluginMcp.mockImplementation((config: unknown) => structuredClone(config));
     mocks.loadMetadataCache.mockReturnValue(null);
     mocks.buildProxyDescription.mockReturnValue("MCP gateway");
     mocks.createDirectToolExecutor.mockReturnValue(vi.fn());
@@ -295,6 +302,25 @@ describe("mcpAdapter session lifecycle", () => {
     expect(commandNames.filter((name: string) => name === "mcp")).toHaveLength(1);
     expect(commandNames.filter((name: string) => name === "pi-mcp")).toHaveLength(1);
     expect(commandNames.filter((name: string) => name === "mcp-auth")).toHaveLength(1);
+  });
+
+  it("discovers configured Claude plugin skills on startup and reload", async () => {
+    let generation = 0;
+    mocks.loadMcpConfig.mockImplementation(() => ({
+      mcpServers: {},
+      claudePlugins: [{ path: `plugin-${++generation}`, skills: true }],
+    }));
+    mocks.discoverConfiguredClaudePluginSkills.mockImplementation((config: { claudePlugins?: Array<{ path: string }> }) =>
+      config.claudePlugins?.map(plugin => `/skills/${plugin.path}`) ?? []);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    const discover = handlers.get("resources_discover")!;
+
+    expect(discover({ cwd: "/project", reason: "initial" })).toEqual({ skillPaths: ["/skills/plugin-2"] });
+    expect(discover({ cwd: "/project", reason: "reload" })).toEqual({ skillPaths: ["/skills/plugin-3"] });
+    expect(mocks.discoverConfiguredClaudePluginSkills).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the proxy tool when direct tools are still missing from cache", async () => {
@@ -1586,6 +1612,39 @@ describe("mcpAdapter session lifecycle", () => {
       expect.objectContaining({ config: expect.objectContaining({ mcpServers: config.mcpServers }) }),
     );
     expect(mocks.initializeMcp.mock.calls[0][3].config).not.toBe(config);
+  });
+
+  it("keeps programmatic relative Claude plugin paths stable when the session cwd differs", async () => {
+    const processCwd = "/process-project";
+    const sessionCwd = "/active-project";
+    vi.spyOn(process, "cwd").mockReturnValue(processCwd);
+    const config = {
+      mcpServers: {},
+      claudePlugins: [{ path: "./plugins/local", mcp: true, skills: true }],
+    };
+    const state = createState();
+    mocks.initializeMcp.mockResolvedValue(state);
+
+    const { createMcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    createMcpAdapter({ config })(api);
+
+    const expectedPath = resolve(processCwd, "./plugins/local");
+    expect(mocks.resolveConfiguredClaudePluginMcp.mock.calls[0]?.[0]).toEqual({
+      mcpServers: {},
+      claudePlugins: [{ path: expectedPath, mcp: true, skills: true }],
+    });
+
+    await handlers.get("session_start")?.({}, { hasUI: false, mode: "print", cwd: sessionCwd });
+    await Promise.resolve();
+    const runtimeConfig = mocks.initializeMcp.mock.calls[0]?.[3].config;
+    expect(runtimeConfig.claudePlugins[0].path).toBe(expectedPath);
+    expect(mocks.initializeMcp.mock.calls[0]?.[1].cwd).toBe(sessionCwd);
+
+    const discover = handlers.get("resources_discover")!;
+    discover({ cwd: sessionCwd, reason: "reload" });
+    expect(mocks.discoverConfiguredClaudePluginSkills.mock.calls[0]?.[0].claudePlugins[0].path).toBe(expectedPath);
+    expect(mocks.discoverConfiguredClaudePluginSkills.mock.calls[0]?.[1]).toBe(sessionCwd);
   });
 
   it("adds strict direct-tool argument preparation only when configured", async () => {

@@ -1,11 +1,12 @@
 import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
+import { resolve } from "node:path";
 import type { McpExtensionState } from "./state.ts";
 import type { DirectToolSpec, McpAdapterOptions, McpConfig, PromptMetadata, ServerEntry } from "./types.ts";
 import type { McpOAuthRuntime } from "./mcp-auth-flow.ts";
 import { Type } from "typebox";
 import type { TSchema } from "typebox";
 import { showStatus, showTools, showPrompts, reconnectServer, reconnectServers, authenticateServer, logoutServer, manageBearerToken, openMcpAuthPanel, openMcpPanel, openMcpSetup } from "./commands.ts";
-import { cloneMcpConfig, loadMcpConfig, writeProjectServerDisabledOverride } from "./config.ts";
+import { cloneMcpConfig, discoverConfiguredClaudePluginSkills, loadMcpConfig, resolveConfiguredClaudePluginMcp, writeProjectServerDisabledOverride } from "./config.ts";
 import { buildProxyDescription, createDirectToolExecutor, getMissingConfiguredDirectToolServers, prepareDirectToolArguments, resolveDirectTools } from "./direct-tools.ts";
 import { flushMetadataCache, initializeMcp, updateStatusBar } from "./init.ts";
 import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
@@ -91,6 +92,24 @@ export interface McpRuntimeSnapshotRequest {
 // Fast path for callers that share the adapter's module and ExtensionAPI.
 const runtimeRegistrars = new WeakMap<ExtensionAPI, (name: string, definition: ServerEntry) => McpServerRegistration>();
 const runtimeSnapshotters = new WeakMap<ExtensionAPI, (name: string) => McpRuntimeServerSnapshot>();
+
+function resolveProgrammaticClaudePluginPath(path: string, cwd: string): string {
+  if (path === "~") return resolve(process.env.HOME ?? "", ".");
+  if (path.startsWith("~/")) return resolve(process.env.HOME ?? "", path.slice(2));
+  return resolve(cwd, path);
+}
+
+function normalizeProgrammaticConfig(config: McpConfig): McpConfig {
+  if (!config.claudePlugins) return config;
+  const cwd = process.cwd();
+  return {
+    ...config,
+    claudePlugins: config.claudePlugins.map(plugin => ({
+      ...plugin,
+      path: resolveProgrammaticClaudePluginPath(plugin.path, cwd),
+    })),
+  };
+}
 
 async function awaitWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | typeof INIT_WAIT_TIMED_OUT> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -232,7 +251,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     ? undefined
     : options.configPath ?? getConfigPathFromArgv();
   const earlyConfig = programmaticConfig
-    ? cloneMcpConfig(sessionConfig)
+    ? resolveConfiguredClaudePluginMcp(cloneMcpConfig(sessionConfig), process.cwd())
     : loadMcpConfig(earlyConfigPath);
   const earlyCache = loadMetadataCache();
   const envRaw = process.env.MCP_DIRECT_TOOLS;
@@ -686,6 +705,14 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       } as unknown as ExtensionContext, owner, oauthRuntime, generation, "stale_load_time_initialization");
     });
   }
+
+  pi.on("resources_discover", (event) => {
+    const resourceConfig = programmaticConfig
+      ? cloneMcpConfig(sessionConfig)
+      : loadMcpConfig(earlyConfigPath, event.cwd);
+    const skillPaths = discoverConfiguredClaudePluginSkills(resourceConfig, event.cwd);
+    return skillPaths.length > 0 ? { skillPaths } : undefined;
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     const generation = ++lifecycleGeneration;
@@ -1314,7 +1341,11 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
 }
 
 export function createMcpAdapter(options: McpAdapterOptions = {}) {
-  const factoryConfig = options.config !== undefined ? cloneMcpConfig(options.config) : undefined;
+  // Snapshot programmatic plugin roots at the API boundary so early and
+  // session-scoped loading cannot resolve the same relative path differently.
+  const factoryConfig = options.config !== undefined
+    ? normalizeProgrammaticConfig(cloneMcpConfig(options.config))
+    : undefined;
   return function mcpAdapter(pi: ExtensionAPI) {
     installMcpAdapter(pi, {
       ...(options.configPath !== undefined ? { configPath: options.configPath } : {}),
