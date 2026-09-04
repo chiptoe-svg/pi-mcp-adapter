@@ -218,6 +218,28 @@ function connectedStatusSnapshot(toolCount: number) {
   };
 }
 
+// Models Pi's runtime tool registry: registering a name for the first time
+// appends it to the active set, re-registering a known name does not, and
+// unregisterTool (when the host has it) forgets the name again.
+function trackRuntimeToolActivation(api: any, initialActiveTools: string[]): () => string[] {
+  const registry = new Set(initialActiveTools);
+  let activeTools = [...initialActiveTools];
+  api.registerTool.mockImplementation((tool: { name: string }) => {
+    if (registry.has(tool.name)) return;
+    registry.add(tool.name);
+    activeTools.push(tool.name);
+  });
+  api.unregisterTool?.mockImplementation((toolName: string) => {
+    activeTools = activeTools.filter((name) => name !== toolName);
+    return registry.delete(toolName);
+  });
+  api.getActiveTools.mockImplementation(() => [...activeTools]);
+  api.setActiveTools.mockImplementation((nextActiveTools: string[]) => {
+    activeTools = [...nextActiveTools];
+  });
+  return () => [...activeTools];
+}
+
 describe("mcpAdapter session lifecycle", () => {
   const originalDirectTools = process.env.MCP_DIRECT_TOOLS;
 
@@ -735,7 +757,8 @@ describe("mcpAdapter session lifecycle", () => {
       description: "Search demo",
     }]);
     mocks.initializeMcp.mockResolvedValue(state);
-    mocks.executeConnect.mockResolvedValue({ content: [{ type: "text", text: "connected" }] });
+    const connectResult = { content: [{ type: "text", text: "connected" }] };
+    mocks.executeConnect.mockResolvedValue(connectResult);
 
     const { default: mcpAdapter } = await import("../index.ts");
     const { api, handlers } = createPi();
@@ -746,13 +769,282 @@ describe("mcpAdapter session lifecycle", () => {
     const callsAfterInitialSync = mocks.resolveDirectTools.mock.calls.length;
     const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
 
-    await proxyTool.execute("call-1", { connect: "demo" });
+    expect(await proxyTool.execute("call-1", { connect: "demo" })).toBe(connectResult);
     const commandDef = api.registerCommand.mock.calls.find((call: any[]) => call[0] === "mcp")?.[1];
     await commandDef.handler("reconnect demo", { hasUI: false });
 
     expect(mocks.executeConnect).toHaveBeenCalledWith(state, "demo", undefined);
     expect(mocks.reconnectServers).toHaveBeenCalledWith(state, expect.any(Object), "demo");
     expect(mocks.resolveDirectTools).toHaveBeenCalledTimes(callsAfterInitialSync);
+  });
+
+  it("reports direct tools discovered by proxy connect as addedToolNames without rewriting active tools", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([])
+      .mockReturnValueOnce([])
+      .mockReturnValue([
+        { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" },
+        { serverName: "demo", originalName: "read", prefixedName: "demo_read", description: "Read demo" },
+      ]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const connectResult = { content: [{ type: "text", text: "connected" }], details: { mode: "connect" } };
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      // A live connect refreshes metadata, which syncs the tool surface before executeConnect returns.
+      currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      return connectResult;
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    const activeTools = trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+    const activeBeforeConnect = activeTools();
+
+    const result = await proxyTool.execute("call-1", { connect: "demo" });
+
+    expect(result).toMatchObject({ content: connectResult.content, details: connectResult.details });
+    expect(result.addedToolNames).toEqual(["demo_search", "demo_read"]);
+    expect(activeTools()).toEqual([...activeBeforeConnect, "demo_search", "demo_read"]);
+    expect(api.setActiveTools).not.toHaveBeenCalled();
+  });
+
+  it("returns the proxy connect result untouched when no direct tools were added", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools.mockReturnValue([
+      { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" },
+    ]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const connectResult = { content: [{ type: "text", text: "connected" }] };
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      return connectResult;
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    expect(await proxyTool.execute("call-1", { connect: "demo" })).toBe(connectResult);
+    expect(api.setActiveTools).not.toHaveBeenCalled();
+  });
+
+  it("attributes only the connected server's direct tools when another server registers during the connect", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+        other: { command: "other", directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([])
+      .mockReturnValueOnce([])
+      .mockReturnValue([
+        { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" },
+        { serverName: "other", originalName: "list", prefixedName: "other_list", description: "List other" },
+      ]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const connectResult = { content: [{ type: "text", text: "connected" }], details: { mode: "connect" } };
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      // Another server's metadata refresh lands while this connect is in flight.
+      currentState.onToolMetadataUpdated?.("other", "list-changed");
+      currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      return connectResult;
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    const result = await proxyTool.execute("call-1", { connect: "demo" });
+
+    expect(result.addedToolNames).toEqual(["demo_search"]);
+    expect(api.setActiveTools).not.toHaveBeenCalled();
+  });
+
+  it("reports same-server overlapping connect discovery only once", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([])
+      .mockReturnValueOnce([])
+      .mockReturnValue([
+        { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" },
+      ]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const firstStarted = createDeferred<void>();
+    const secondStarted = createDeferred<void>();
+    const discovery = createDeferred<void>();
+    let connectCount = 0;
+    const connectResult = { content: [{ type: "text", text: "connected" }] };
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      const started = connectCount++ === 0 ? firstStarted : secondStarted;
+      started.resolve();
+      await discovery.promise;
+      currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      return connectResult;
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    const firstConnect = proxyTool.execute("call-1", { connect: "demo" });
+    await firstStarted.promise;
+    const secondConnect = proxyTool.execute("call-2", { connect: "demo" });
+    await secondStarted.promise;
+    discovery.resolve();
+
+    const [firstResult, secondResult] = await Promise.all([firstConnect, secondConnect]);
+
+    expect(firstResult.addedToolNames).toEqual(["demo_search"]);
+    expect(secondResult).not.toHaveProperty("addedToolNames");
+  });
+
+  it("reports same-server overlapping connect reactivation only once", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+      },
+    };
+    const search = { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" };
+    const restoredSearch = { ...search, description: "Search demo restored" };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([search])
+      .mockReturnValueOnce([search])
+      .mockReturnValueOnce([])
+      .mockReturnValueOnce([restoredSearch])
+      .mockReturnValue([restoredSearch]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    const firstStarted = createDeferred<void>();
+    const secondStarted = createDeferred<void>();
+    const discovery = createDeferred<void>();
+    let connectCount = 0;
+    const connectResult = { content: [{ type: "text", text: "connected" }] };
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      const started = connectCount++ === 0 ? firstStarted : secondStarted;
+      started.resolve();
+      await discovery.promise;
+      if (connectCount === 2) {
+        currentState.onToolMetadataUpdated?.("demo", "list-changed");
+        currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      }
+      return connectResult;
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi({ unregisterTool: false });
+    trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    const firstConnect = proxyTool.execute("call-1", { connect: "demo" });
+    await firstStarted.promise;
+    const secondConnect = proxyTool.execute("call-2", { connect: "demo" });
+    await secondStarted.promise;
+    discovery.resolve();
+
+    const results = await Promise.all([firstConnect, secondConnect]);
+
+    expect(results.map((result) => result.addedToolNames).filter(Boolean)).toEqual([["demo_search"]]);
+  });
+
+  it("keeps stale direct tools out of addedToolNames and deactivates them explicitly without unregisterTool", async () => {
+    const config = {
+      mcpServers: {
+        demo: { command: "demo", directTools: true },
+      },
+    };
+    const search = { serverName: "demo", originalName: "search", prefixedName: "demo_search", description: "Search demo" };
+    const lookup = { serverName: "demo", originalName: "lookup", prefixedName: "demo_lookup", description: "Lookup demo" };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([search])
+      .mockReturnValueOnce([search])
+      .mockReturnValueOnce([lookup])
+      .mockReturnValueOnce([lookup])
+      .mockReturnValue([search]);
+    mocks.initializeMcp.mockResolvedValue(state);
+    mocks.executeConnect.mockImplementation(async (currentState: any) => {
+      currentState.onToolMetadataUpdated?.("demo", "proxy-connect");
+      return { content: [{ type: "text", text: "connected" }] };
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi({ unregisterTool: false });
+    const activeTools = trackRuntimeToolActivation(api, ["bash", "mcp"]);
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const activeBeforeConnect = activeTools();
+    expect(activeBeforeConnect).toContain("demo_search");
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    // Metadata replaced demo_search with demo_lookup: the removal is an explicit
+    // active-set rewrite, the addition rides on the result.
+    const replaced = await proxyTool.execute("call-1", { connect: "demo" });
+    const activeAfterReplace = [...activeBeforeConnect.filter((name) => name !== "demo_search"), "demo_lookup"];
+    expect(api.unregisterTool).toBeUndefined();
+    expect(replaced.addedToolNames).toEqual(["demo_lookup"]);
+    expect(api.setActiveTools).toHaveBeenCalledWith(activeAfterReplace);
+    expect(activeTools()).toEqual(activeAfterReplace);
+
+    // demo_search comes back: Pi does not re-activate a name it already knows,
+    // so the adapter re-adds it and reports it on this result too.
+    const restored = await proxyTool.execute("call-2", { connect: "demo" });
+    expect(restored.addedToolNames).toEqual(["demo_search"]);
+    expect(activeTools()).toEqual([...activeAfterReplace.filter((name) => name !== "demo_lookup"), "demo_search"]);
   });
 
   it("keeps hidden direct tool names reserved against namespace proxies during backoff", async () => {
