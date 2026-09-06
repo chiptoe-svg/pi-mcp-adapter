@@ -572,6 +572,13 @@ export interface McpSettings {
   requestTimeoutMs?: number; // milliseconds, overrides the SDK request timeout when > 0
   directTools?: boolean | "search";
   /**
+   * Ceiling on simultaneously ACTIVE search-activated direct tools. Only
+   * meaningful when some server uses `directTools: "search"`. Defaults to 24.
+   * Counts search-activated tools only: built-ins, other extensions' tools,
+   * eager direct tools and the `mcp` proxy are neither counted nor evicted.
+   */
+  activeToolCap?: number;
+  /**
    * Validate direct-tool inputs against the advertised schema after recovering
    * one JSON string layer for object and array properties. Defaults to false.
    */
