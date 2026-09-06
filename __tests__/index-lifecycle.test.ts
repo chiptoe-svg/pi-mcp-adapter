@@ -2448,7 +2448,7 @@ describe("mcpAdapter session lifecycle", () => {
   });
 });
 
-describe("directTools: \"search\" — registered inactive, activated by search", () => {
+describe("directTools: \"search\" — registered inactive, activated by search, under a cap", () => {
   const originalDirectTools = process.env.MCP_DIRECT_TOOLS;
   beforeEach(() => {
     delete process.env.MCP_DIRECT_TOOLS;
@@ -2483,11 +2483,12 @@ describe("directTools: \"search\" — registered inactive, activated by search",
     details: { mode: "search", matches: names.map((tool) => ({ server: "demo", tool: `demo_${tool}`, score: 1 })), count: names.length, hasMore: false, nextOffset: null, query: "q" },
   });
 
-  async function boot(settings: Record<string, unknown> = {}, specs = [lazySpec("alpha"), lazySpec("beta"), lazySpec("gamma"), lazySpec("delta")]) {
-    // scriptMode off keeps the floor at exactly bash + mcp, so the active-set assertions below are legible.
+  async function boot(settings: Record<string, unknown> = {}, specs = [lazySpec("alpha"), lazySpec("beta"), lazySpec("gamma"), lazySpec("delta")], stateExtras: Record<string, unknown> = {}) {
+    // scriptMode off keeps the floor at exactly bash + mcp, so the cap arithmetic below is legible.
     const config = { settings: { scriptMode: false, ...settings }, mcpServers: { demo: { command: "demo", directTools: "search" } } };
     const state = createState();
     state.config = config;
+    Object.assign(state, stateExtras);
     mocks.loadMcpConfig.mockReturnValue(config);
     mocks.resolveDirectTools.mockReturnValue(specs);
     mocks.initializeMcp.mockResolvedValue(state);
@@ -2500,7 +2501,7 @@ describe("directTools: \"search\" — registered inactive, activated by search",
     await Promise.resolve();
     const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
     const directTool = (name: string) => api.registerTool.mock.calls.find((call: any[]) => call[0].name === name)?.[0];
-    return { api, activeTools, proxyTool, directTool };
+    return { api, handlers, state, activeTools, proxyTool, directTool };
   }
 
   it("registers lazy tools but holds them out of the active set", async () => {
@@ -2562,12 +2563,171 @@ describe("directTools: \"search\" — registered inactive, activated by search",
     expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
   });
 
-  it("a proxy call for a held tool does not activate it", async () => {
-    const { activeTools, proxyTool } = await boot();
+  it("a proxy call for a held tool activates it as used and reports it as addedToolNames", async () => {
+    const { activeTools, proxyTool } = await boot({ activeToolCap: 1 });
     mocks.executeCall.mockResolvedValue({ content: [{ type: "text", text: "ok" }], details: { mode: "call", server: "demo", tool: "alpha" } });
     const result = await proxyTool.execute("call-1", { tool: "demo_alpha", args: {} });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+    expect(result.addedToolNames).toEqual(["demo_alpha"]);
+    expect(result.content.map((block: any) => block.text).join("\n")).toContain("Activated as a direct tool: demo_alpha");
+    // A call is a use: the tool keeps its slot when a later search would overflow the ceiling.
+    mocks.executeSearch.mockReturnValue(searchResult("gamma"));
+    const search = await proxyTool.execute("call-2", { search: "q" });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+    expect(search.content[0].text).toContain("ceiling");
+    // Calling an already-active tool through the proxy changes nothing.
+    const again = await proxyTool.execute("call-3", { tool: "demo_alpha", args: {} });
+    expect(again.addedToolNames).toBeUndefined();
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+  });
+
+  it("a proxy call for a held resource reader activates it by resourceUri", async () => {
+    const reader = { ...lazySpec("read_notes"), resourceUri: "file:///notes.md" };
+    const { activeTools, proxyTool } = await boot({}, [reader, lazySpec("beta")]);
+    mocks.executeCall.mockResolvedValue({ content: [{ type: "text", text: "notes" }], details: { mode: "call", server: "demo", resourceUri: "file:///notes.md" } });
+    const result = await proxyTool.execute("call-1", { tool: "demo_read_notes", args: {} });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_read_notes"]);
+    expect(result.addedToolNames).toEqual(["demo_read_notes"]);
+    // A resource URI that matches no held reader activates nothing.
+    mocks.executeCall.mockResolvedValue({ content: [{ type: "text", text: "x" }], details: { mode: "call", server: "demo", resourceUri: "file:///other.md" } });
+    const other = await proxyTool.execute("call-2", { tool: "demo_read_other", args: {} });
+    expect(other.addedToolNames).toBeUndefined();
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_read_notes"]);
+  });
+
+  it("a search-mode tool that becomes eager leaves the search bookkeeping (floor, not counted, never evicted)", async () => {
+    const { activeTools, proxyTool } = await boot({ activeToolCap: 1 });
+    mocks.executeCall.mockResolvedValue({ content: [{ type: "text", text: "ok" }], details: { mode: "call", server: "demo", tool: "alpha" } });
+    await proxyTool.execute("call-1", { tool: "demo_alpha", args: {} });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+    // The server flips to eager direct tools (e.g. via the /mcp panel); alpha is re-resolved non-lazy.
+    mocks.resolveDirectTools.mockReturnValue([{ ...lazySpec("alpha"), lazy: false }, lazySpec("gamma")]);
+    mocks.executeConnect.mockResolvedValue({ content: [{ type: "text", text: "connected" }] });
+    await proxyTool.execute("call-2", { connect: "demo" });
+    // alpha is floor now: a search must not count it against the cap nor evict it.
+    mocks.executeSearch.mockReturnValue(searchResult("gamma"));
+    const search = await proxyTool.execute("call-3", { search: "q" });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha", "demo_gamma"]);
+    expect(search.addedToolNames).toEqual(["demo_gamma"]);
+    expect(search.content[0].text).not.toContain("ceiling");
+  });
+
+  it("a proxy call that does not resolve to a held tool activates nothing", async () => {
+    const { activeTools, proxyTool } = await boot();
+    mocks.executeCall.mockResolvedValue({ content: [{ type: "text", text: "not found" }], details: { mode: "call", error: "tool_not_found", requestedTool: "demo_zeta" } });
+    const result = await proxyTool.execute("call-1", { tool: "demo_zeta", args: {} });
+    expect(activeTools()).toEqual(["bash", "mcp"]);
     expect(result.addedToolNames).toBeUndefined();
-    expect(activeTools()).toEqual(["bash", "mcp"]); // search is the only load point
+  });
+
+  it("stops at the cap and says so, evicting the least-recently-used unused tool first", async () => {
+    // The cap counts search-activated tools only; the floor (bash + mcp) is outside it.
+    const { activeTools, proxyTool, directTool } = await boot({ activeToolCap: 2 });
+    mocks.executeSearch.mockReturnValue(searchResult("alpha"));
+    await proxyTool.execute("c1", { search: "q" });
+    mocks.executeSearch.mockReturnValue(searchResult("beta"));
+    await proxyTool.execute("c2", { search: "q" });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha", "demo_beta"]);
+
+    // Using alpha makes beta the stale one.
+    await directTool("demo_alpha").execute("c3", {});
+
+    mocks.executeSearch.mockReturnValue(searchResult("gamma", "delta"));
+    const result = await proxyTool.execute("c4", { search: "q" });
+    expect(activeTools()).toContain("demo_alpha"); // used → survived
+    expect(activeTools()).not.toContain("demo_beta"); // stale → evicted
+    expect(activeTools()).toContain("demo_gamma");
+    expect(activeTools()).not.toContain("demo_delta"); // over the ceiling
+    expect(activeTools().length).toBe(4); // floor of 2 + cap of 2
+    expect(result.content[0].text).toContain("Deactivated (unused, at the 2-tool ceiling): demo_beta");
+    expect(result.content[0].text).toContain("ceiling is full");
+    expect(result.details.evicted).toEqual(["demo_beta"]);
+  });
+
+  it("does not count the floor against the cap, and refuses to evict a used tool to make room", async () => {
+    const { activeTools, proxyTool, directTool } = await boot({ activeToolCap: 1 });
+    mocks.executeSearch.mockReturnValue(searchResult("alpha"));
+    await proxyTool.execute("c1", { search: "q" });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]); // floor untouched by a cap of 1
+    await directTool("demo_alpha").execute("c2", {}); // now in use → keeps its slot
+    mocks.executeSearch.mockReturnValue(searchResult("beta"));
+    const result = await proxyTool.execute("c3", { search: "q" });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+    expect(result.addedToolNames).toBeUndefined();
+    expect(result.content[0].text).toContain("ceiling with nothing unused to free");
+  });
+
+  const consent = () => ({ clear: vi.fn(), restoreDecision: vi.fn() });
+
+  it("at session start, re-activates the search-mode tools the transcript says were loaded, newest first under the cap", async () => {
+    // The resumed transcript: two earlier searches loaded alpha+beta, then gamma.
+    const getBranch = vi.fn(() => [
+        { type: "message", message: { role: "user", content: "find tools" } },
+        { type: "message", message: { role: "toolResult", toolName: "mcp", addedToolNames: ["demo_alpha", "demo_beta"] } },
+        { type: "message", message: { role: "toolResult", toolName: "mcp", addedToolNames: ["demo_gamma"] } },
+        { type: "message", message: { role: "toolResult", toolName: "other", addedToolNames: ["demo_delta"] } }, // not ours
+      ]);
+    // reason "startup" on purpose: a `--session <file>` launch (one process per
+    // turn under an rpc host) starts this way with a full transcript.
+    const { activeTools } = await boot({ activeToolCap: 2 }, undefined, { sessionManager: { getBranch }, consentManager: consent() });
+    // Reconciliation runs after initialization resolves (post-init surface
+    // sync), which is a few ticks later than the early registration pass.
+    await vi.waitFor(() => expect(activeTools()).toContain("demo_gamma"));
+    expect(getBranch).toHaveBeenCalled();
+    // Newest first: gamma, then alpha+beta — the cap of 2 keeps gamma and alpha.
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_gamma", "demo_alpha"]);
+    expect(activeTools()).not.toContain("demo_delta"); // another tool's result is not ours
+  });
+
+  it("a restart keeps the used-slot protection of a tool the transcript shows the model called", async () => {
+    // Before the restart: alpha was loaded and then called; a later search loaded beta.
+    const getBranch = () => [
+      { type: "message", message: { role: "toolResult", toolName: "mcp", addedToolNames: ["demo_alpha"] } },
+      { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "demo_alpha", arguments: {} }] } },
+      { type: "message", message: { role: "toolResult", toolName: "mcp", addedToolNames: ["demo_beta"] } },
+    ];
+    const { activeTools, proxyTool } = await boot({ activeToolCap: 1 }, undefined, { sessionManager: { getBranch }, consentManager: consent() });
+    // Under a cap of 1 the used tool is restored ahead of the newer, never-called one.
+    await vi.waitFor(() => expect(activeTools()).toContain("demo_alpha"));
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+    // ...and it is still protected: a new search cannot evict it, same as without the restart.
+    mocks.executeSearch.mockReturnValue(searchResult("gamma"));
+    const search = await proxyTool.execute("c1", { search: "q" });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+    expect(search.addedToolNames).toBeUndefined();
+    expect(search.content[0].text).toContain("ceiling with nothing unused to free");
+  });
+
+  it("tree navigation releases tools loaded on the branch the session left, and restores the new branch's", async () => {
+    let branch: unknown[] = [];
+    const sessionManager = { getBranch: () => branch };
+    const { handlers, state, activeTools, proxyTool, directTool } = await boot({ activeToolCap: 1 }, undefined, { sessionManager, consentManager: consent() });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Branch A: load alpha and call it (protected).
+    mocks.executeSearch.mockReturnValue(searchResult("alpha"));
+    await proxyTool.execute("c1", { search: "q" });
+    await directTool("demo_alpha").execute("c2", {});
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+    // Navigate to before that load: the active branch no longer records alpha.
+    branch = [{ type: "message", message: { role: "user", content: "earlier" } }];
+    handlers.get("session_tree")?.({}, { sessionManager });
+    expect(activeTools()).toEqual(["bash", "mcp"]); // slot released
+    // Branch B: a search for beta fits under the cap; alpha no longer occupies it.
+    mocks.executeSearch.mockReturnValue(searchResult("beta"));
+    const search = await proxyTool.execute("c3", { search: "q" });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_beta"]);
+    expect(search.addedToolNames).toEqual(["demo_beta"]);
+    // Navigating back to a branch that loaded alpha brings it back (beta released).
+    branch = [{ type: "message", message: { role: "toolResult", toolName: "mcp", addedToolNames: ["demo_alpha"] } }];
+    handlers.get("session_tree")?.({}, { sessionManager });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+    void state;
+  });
+
+  it("a transcript with no search results re-activates nothing and lazy tools stay held", async () => {
+    const { activeTools } = await boot({}, [lazySpec("alpha")], { sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", content: "hello" } }] }, consentManager: consent() });
+    await new Promise((resolve) => setTimeout(resolve, 20)); // let post-init work settle
+    expect(activeTools()).toEqual(["bash", "mcp"]);
   });
 
   it("connect does not report held-inactive search-mode tools as loaded", async () => {

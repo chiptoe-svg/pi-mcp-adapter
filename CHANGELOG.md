@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `directTools: "search"` registers a server's tools as real direct tools but inactive; `mcp({ search })` activates the matches additively, reported as `addedToolNames`. Activation is per process and search is its only trigger. Search-mode tools do not count toward the 75-tool advisory.
+- `directTools: "search"` registers a server's tools as real direct tools but inactive; `mcp({ search })` activates the matches additively, reported as `addedToolNames`, and so does a successful `mcp({ tool })` call for one. `settings.activeToolCap` (default 24) bounds the active set with least-recently-used eviction that never touches built-ins, eager direct tools, the proxy, or a tool the model has called. At session start and on tree navigation the active set is reconciled against the transcript branch, so a resumed session keeps its loaded tools (and their used-slot protection) and a left branch's tools are released. Search-mode tools do not count toward the 75-tool advisory.
 - Script `tools.describe()` now exposes server-advertised output schemas for `data.structuredContent`, preserved through metadata caching and refresh. (#522)
 - Stdio MCP servers can opt out of arbitrary adapter environment inheritance with `inheritEnv: false`; SDK platform defaults and explicit `env` overlays remain. Thanks to [@zenolam](https://github.com/zenolam) for #509.
 - Local Claude plugin bundles can now be loaded from trusted configured directories, including bundled MCP servers and skills. Thanks to [@gugu91](https://github.com/gugu91) for PR #493.

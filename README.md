@@ -451,6 +451,7 @@ When any enabled server uses `eager` or `keep-alive`, initialization also starts
 | `oauthDir` | Legacy OAuth `tokens.json` import directory for this MCP config. Relative paths resolve from the active project cwd. `MCP_OAUTH_DIR` still wins when set. Persistent OAuth credentials are stored in the OS credential store, not this directory. |
 | `mcpServers.<name>.oauth.authorizationParams` | Extra authorization URL parameters for provider-specific OAuth extensions. Flow-owned parameters such as `client_id`, `redirect_uri`, `scope`, `state`, `code_challenge`, `response_type`, and `resource` cannot be overridden. |
 | `directTools` | Global default for all servers (default: false). `true`, `false`, or `"search"`. Per-server overrides this. |
+| `activeToolCap` | Ceiling on simultaneously active search-activated direct tools (default: 24). Only applies to `directTools: "search"`. |
 | `strictDirectToolArguments` | Validate direct-tool inputs against their advertised schemas and recover one JSON string layer for object and array properties (default: false). |
 | `directToolResultDetails` | Direct-tool result details: `"lean"` (default) or `"bounded"` to retain the guarded raw MCP result. |
 | `warnOnLargeDirectTools` | Show the advisory when 75 or more direct tools resolve (default: `true`). Set to `false` to suppress only this advisory. |
@@ -640,6 +641,7 @@ Per-server `directTools` overrides the global setting. The example above registe
 
 ```json
 {
+  "settings": { "activeToolCap": 24 },
   "mcpServers": {
     "github": {
       "command": "npx",
@@ -652,7 +654,11 @@ Per-server `directTools` overrides the global setting. The example above registe
 
 The model starts each turn seeing only the `mcp` proxy (and any eager direct tools). When it searches, matching tools from search-mode servers become active direct tools, reported on the result as `addedToolNames` so Pi treats that point as their load point. What it activates are real tools with real schemas, not a proxy call.
 
-Activation happens at exactly one point: a successful `mcp({ search })` whose matches include the tool. Nothing else activates a search-mode tool — not a `mcp({ tool })` call, not a `connect`, not a session restart — and nothing deactivates one; the active set only grows within a process. Activation state lives in the running process: a new process (a restart, or a resumed session) starts with every search-mode tool held again until a search matches it, so the model may need to search once more after a resume. Selecting a server's tools eagerly (`directTools: true`, in config or from the `/mcp` panel) activates any of its tools that were held, and switching a server to `"search"` holds its tools again. The search result lists what it activated, and the search text follows unchanged. Search-mode tools do not count toward the 75-tool advisory.
+A search-mode tool activates at two points: a `mcp({ search })` whose matches include it, or a successful `mcp({ tool })` call for it (a generated resource reader included) — the call is as clear a signal as a search hit, and the result says the tool is now direct. Selecting a server's tools eagerly (`directTools: true`, in config or from the `/mcp` panel) activates any of its tools that were held, and switching a server to `"search"` holds its tools again.
+
+`activeToolCap` bounds how many search-activated tools stay active at once (default 24). It counts only those: the floor — Pi's built-ins, other extensions' tools, eager direct tools, the `mcp` proxy — is neither counted nor evicted, so the total active set is your floor plus at most the cap. When the ceiling is reached, the least-recently-used search-activated tool that the model has **not** called is deactivated first; a tool the model has called keeps its slot for the session, so a tool in use cannot vanish under it. If every slot is held by a used tool, nothing new activates and the result says so — `mcp({ tool })` always works as the fallback. The search result says what was activated, what was deactivated, and when the ceiling truncated the match list, so the model can narrow the query or fall back to `mcp({ tool })`.
+
+Activation state lives in the running process, but the transcript is the durable record: at session start, and whenever tree navigation changes the active branch, the adapter reconciles against that branch — search-mode tools it reports as loaded (the `addedToolNames` on earlier `mcp` results) are re-activated under the cap, tools the model went on to call keep their used-slot protection and are restored first, the rest newest first, and tools loaded only on a branch the session has left are released. Search-mode tools do not count toward the 75-tool advisory.
 
 To expose only a subset of a noisy server, add `includeTools` on the server. Values can be exact original names, generated resource names such as `read_<resource>`, prefixed names, or simple glob patterns:
 
