@@ -784,7 +784,7 @@ Per-server `directTools` overrides the global setting. The example above registe
 }
 ```
 
-A successful `mcp({ search })` activates matching search-mode tools additively for the process lifetime and reports newly activated names in `addedToolNames`; no other operation activates them. A restart or resumed session starts with them inactive again. Selecting `directTools: true` activates held tools, while switching back to `"search"` holds them again. Search-mode tools do not count toward the 75-tool advisory.
+A successful `mcp({ search })` activates matching search-mode tools additively and reports newly activated names in `addedToolNames`. A successful `mcp({ tool })` call for a held search-mode tool activates it the same way, so the next call uses its real schema. At session start and on branch navigation, the tools earlier `addedToolNames` on the active branch recorded are re-activated, so a restarted or resumed session keeps the tools it had loaded. Selecting `directTools: true` activates held tools, while switching back to `"search"` holds them again. Search-mode tools do not count toward the 75-tool advisory.
 
 To expose only a subset of a noisy server, add `includeTools` on the server. Values can be exact original names, generated resource names such as `read_<resource>`, prefixed names, or simple glob patterns:
 

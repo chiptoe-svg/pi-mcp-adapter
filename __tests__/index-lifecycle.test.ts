@@ -3695,10 +3695,11 @@ describe("directTools: \"search\" — registered inactive, activated by search",
     details: { mode: "search", matches: names.map((tool) => ({ server: "demo", tool: `demo_${tool}`, score: 1 })), count: names.length, hasMore: false, nextOffset: null, query: "q" },
   });
 
-  async function boot(settings: Record<string, unknown> = {}, specs = [lazySpec("alpha"), lazySpec("beta"), lazySpec("gamma"), lazySpec("delta")]) {
+  async function boot(settings: Record<string, unknown> = {}, specs = [lazySpec("alpha"), lazySpec("beta"), lazySpec("gamma"), lazySpec("delta")], stateExtras: Record<string, unknown> = {}) {
     const config = { settings: { scriptMode: false, ...settings }, mcpServers: { demo: { command: "demo", directTools: "search" } } };
     const state = createState();
     state.config = config;
+    Object.assign(state, stateExtras);
     mocks.loadMcpConfig.mockReturnValue(config);
     mocks.resolveDirectTools.mockReturnValue(specs);
     mocks.initializeMcp.mockResolvedValue(state);
@@ -3717,7 +3718,8 @@ describe("directTools: \"search\" — registered inactive, activated by search",
     await Promise.resolve();
     await Promise.resolve();
     const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
-    return { api, handlers, activeTools, activeToolsBeforeSession, proxyTool };
+    const directTool = (name: string) => api.registerTool.mock.calls.find((call: any[]) => call[0].name === name)?.[0];
+    return { api, handlers, state, activeTools, activeToolsBeforeSession, proxyTool, directTool };
   }
 
   it("holds registered lazy tools at session start", async () => {
@@ -3805,11 +3807,88 @@ describe("directTools: \"search\" — registered inactive, activated by search",
     expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
   });
 
-  it("a proxy call for a held tool does not activate it", async () => {
+  it("a proxy call for a held tool activates it and reports it as addedToolNames", async () => {
     const { activeTools, proxyTool } = await boot();
     mocks.executeCall.mockResolvedValue({ content: [{ type: "text", text: "ok" }], details: { mode: "call", server: "demo", tool: "alpha" } });
     const result = await proxyTool.execute("call-1", { tool: "demo_alpha", args: {} });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+    expect(result.addedToolNames).toEqual(["demo_alpha"]);
+    expect(result.content.map((block: any) => block.text).join("\n")).toContain("Activated as a direct tool: demo_alpha");
+    // Calling an already-active tool through the proxy changes nothing.
+    const again = await proxyTool.execute("call-2", { tool: "demo_alpha", args: {} });
+    expect(again.addedToolNames).toBeUndefined();
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+  });
+
+  it("a proxy call for a held resource reader activates it by resourceUri", async () => {
+    const reader = { ...lazySpec("read_notes"), resourceUri: "file:///notes.md" };
+    const { activeTools, proxyTool } = await boot({}, [reader, lazySpec("beta")]);
+    mocks.executeCall.mockResolvedValue({ content: [{ type: "text", text: "notes" }], details: { mode: "call", server: "demo", resourceUri: "file:///notes.md" } });
+    const result = await proxyTool.execute("call-1", { tool: "demo_read_notes", args: {} });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_read_notes"]);
+    expect(result.addedToolNames).toEqual(["demo_read_notes"]);
+    // A resource URI that matches no held reader activates nothing.
+    mocks.executeCall.mockResolvedValue({ content: [{ type: "text", text: "x" }], details: { mode: "call", server: "demo", resourceUri: "file:///other.md" } });
+    const other = await proxyTool.execute("call-2", { tool: "demo_read_other", args: {} });
+    expect(other.addedToolNames).toBeUndefined();
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_read_notes"]);
+  });
+
+  it("a proxy call that does not resolve to a held tool activates nothing", async () => {
+    const { activeTools, proxyTool } = await boot();
+    mocks.executeCall.mockResolvedValue({ content: [{ type: "text", text: "not found" }], details: { mode: "call", error: "tool_not_found", requestedTool: "demo_zeta" } });
+    const result = await proxyTool.execute("call-1", { tool: "demo_zeta", args: {} });
+    expect(activeTools()).toEqual(["bash", "mcp"]);
     expect(result.addedToolNames).toBeUndefined();
+  });
+
+  const consent = () => ({ clear: vi.fn(), restoreDecision: vi.fn() });
+
+  it("at session start, re-activates the search-mode tools the transcript says were loaded, newest first", async () => {
+    // The resumed transcript: two earlier searches loaded alpha+beta, then gamma.
+    const getBranch = vi.fn(() => [
+      { type: "message", message: { role: "user", content: "find tools" } },
+      { type: "message", message: { role: "toolResult", toolName: "mcp", addedToolNames: ["demo_alpha", "demo_beta"] } },
+      { type: "message", message: { role: "toolResult", toolName: "mcp", addedToolNames: ["demo_gamma"] } },
+      { type: "message", message: { role: "toolResult", toolName: "other", addedToolNames: ["demo_delta"] } }, // not ours
+    ]);
+    // reason "startup" on purpose: a `--session <file>` launch (one process per
+    // turn under an rpc host) starts this way with a full transcript.
+    const { activeTools } = await boot({}, undefined, { sessionManager: { getBranch }, consentManager: consent() });
+    // Reconciliation runs after initialization resolves (post-init surface sync).
+    await vi.waitFor(() => expect(activeTools()).toContain("demo_gamma"));
+    expect(getBranch).toHaveBeenCalled();
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_gamma", "demo_alpha", "demo_beta"]);
+    expect(activeTools()).not.toContain("demo_delta"); // another tool's result is not ours
+  });
+
+  it("tree navigation holds tools loaded on the branch the session left, and restores the new branch's", async () => {
+    let branch: unknown[] = [];
+    const sessionManager = { getBranch: () => branch };
+    const { handlers, activeTools, proxyTool } = await boot({}, undefined, { sessionManager, consentManager: consent() });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Branch A: load alpha.
+    mocks.executeSearch.mockReturnValue(searchResult("alpha"));
+    await proxyTool.execute("c1", { search: "q" });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+    // Navigate to before that load: the active branch no longer records alpha.
+    branch = [{ type: "message", message: { role: "user", content: "earlier" } }];
+    handlers.get("session_tree")?.({}, { sessionManager });
+    expect(activeTools()).toEqual(["bash", "mcp"]);
+    // Branch B: load beta.
+    mocks.executeSearch.mockReturnValue(searchResult("beta"));
+    const search = await proxyTool.execute("c2", { search: "q" });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_beta"]);
+    expect(search.addedToolNames).toEqual(["demo_beta"]);
+    // Navigating back to a branch that loaded alpha brings it back and holds beta.
+    branch = [{ type: "message", message: { role: "toolResult", toolName: "mcp", addedToolNames: ["demo_alpha"] } }];
+    handlers.get("session_tree")?.({}, { sessionManager });
+    expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
+  });
+
+  it("a transcript with no search results re-activates nothing and lazy tools stay held", async () => {
+    const { activeTools } = await boot({}, [lazySpec("alpha")], { sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", content: "hello" } }] }, consentManager: consent() });
+    await new Promise((resolve) => setTimeout(resolve, 20)); // let post-init work settle
     expect(activeTools()).toEqual(["bash", "mcp"]);
   });
 

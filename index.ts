@@ -336,6 +336,15 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     !isServerDisabled(definition) && (definition.lifecycle === "eager" || definition.lifecycle === "keep-alive"));
   const registeredDirectTools = new Map<string, string>();
   const registeredDirectToolServers = new Map<string, string>();
+  // prefixed name → the server's own tool name / resource URI, so a proxy call
+  // (which reports server + original name, or server + resourceUri for a
+  // generated resource reader) can find the lazy direct tool it corresponds to.
+  const registeredDirectToolOriginalNames = new Map<string, string>();
+  const registeredDirectToolResourceUris = new Map<string, string>();
+  // Activation is per process; the transcript is the durable record of which
+  // search-mode tools this session loaded. Set on session_start, consumed once
+  // the tool surface is registered.
+  let reconcileFromTranscriptOnInit = false;
   const registeredDirectToolVersions = new Map<string, number>();
   // Overlapping connect results consume each server's discovery names once.
   // Removal clears the record so stale/fallback reactivation is reportable.
@@ -475,6 +484,73 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     return added;
   }
 
+  // The lazy direct tool registered for a server's own tool name, if any.
+  function lazyToolFor(server: string, originalName: string): string | undefined {
+    for (const name of lazyDirectTools) {
+      if (registeredDirectToolServers.get(name) === server && registeredDirectToolOriginalNames.get(name) === originalName) return name;
+    }
+    return undefined;
+  }
+
+  // The lazy resource-reader tool generated for a server's resource, if any.
+  function lazyResourceToolFor(server: string, resourceUri: string): string | undefined {
+    for (const name of lazyDirectTools) {
+      if (registeredDirectToolServers.get(name) === server && registeredDirectToolResourceUris.get(name) === resourceUri) return name;
+    }
+    return undefined;
+  }
+
+  /**
+   * The search-mode tools the active transcript branch loaded: every
+   * addedToolNames on an earlier `mcp` result, newest first.
+   */
+  function readLoadedSearchToolsFromBranch(targetState: McpExtensionState): string[] | undefined {
+    const sessionManager = targetState.sessionManager;
+    if (!sessionManager) return undefined;
+    let branch: readonly unknown[] = [];
+    try {
+      branch = sessionManager.getBranch();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      logger.debug(`MCP: could not read the active session branch for search-tool reconciliation: ${detail}`);
+      return undefined;
+    }
+    const loaded: string[] = [];
+    for (let i = branch.length - 1; i >= 0; i -= 1) {
+      const entry = branch[i] as { type?: string; message?: { role?: string; toolName?: string; addedToolNames?: unknown } } | undefined;
+      const message = entry?.type === "message" ? entry.message : undefined;
+      if (message?.role !== "toolResult" || message.toolName !== "mcp" || !Array.isArray(message.addedToolNames)) continue;
+      for (const name of message.addedToolNames) {
+        if (typeof name === "string" && lazyDirectTools.has(name) && !loaded.includes(name)) loaded.push(name);
+      }
+    }
+    return loaded;
+  }
+
+  /**
+   * Make in-process activation agree with the active transcript branch. Runs
+   * once the tool surface is registered after every session start (a process
+   * launched with `--session <file>` reports reason "startup" with a full
+   * transcript; an rpc host running one process per turn resumes that way every
+   * time) and on tree navigation, so a tool loaded on a branch the session has
+   * left is held again and the current branch's tools come back.
+   */
+  function reconcileSearchActivation(targetState: McpExtensionState): void {
+    if (lazyDirectTools.size === 0) return;
+    const loaded = readLoadedSearchToolsFromBranch(targetState);
+    if (!loaded) return;
+    const loadedSet = new Set(loaded);
+    for (const name of [...searchActivatedTools]) if (!loadedSet.has(name)) searchActivatedTools.delete(name);
+    holdLazyToolsInactive();
+    if (loaded.length === 0) return;
+    const matches = loaded.flatMap((name) => {
+      const server = registeredDirectToolServers.get(name);
+      return server ? [{ server, tool: name }] : [];
+    });
+    const added = activateSearchMatches(matches);
+    if (added.length > 0) logger.debug(`MCP: transcript re-activated ${added.length} search-mode tool(s): ${added.join(", ")}`);
+  }
+
   function activeFailureServers(): Set<string> {
     const currentState = state;
     if (!currentState) return new Set();
@@ -540,6 +616,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         finalizationGuard?.();
         registeredDirectTools.set(spec.prefixedName, fingerprint);
         registeredDirectToolServers.set(spec.prefixedName, spec.serverName);
+        registeredDirectToolOriginalNames.set(spec.prefixedName, spec.originalName);
+        if (spec.resourceUri !== undefined) registeredDirectToolResourceUris.set(spec.prefixedName, spec.resourceUri);
+        else registeredDirectToolResourceUris.delete(spec.prefixedName);
         registeredDirectToolVersions.set(spec.prefixedName, (registeredDirectToolVersions.get(spec.prefixedName) ?? 0) + 1);
         if (previousServer !== spec.serverName) {
           forgetReportedDirectToolName(previousServer, spec.prefixedName);
@@ -571,6 +650,8 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       const serverName = registeredDirectToolServers.get(toolName);
       registeredDirectTools.delete(toolName);
       registeredDirectToolServers.delete(toolName);
+      registeredDirectToolOriginalNames.delete(toolName);
+      registeredDirectToolResourceUris.delete(toolName);
       forgetReportedDirectToolName(serverName, toolName);
       if (lazyDirectTools.delete(toolName)) searchActivatedTools.delete(toolName);
       deactivated.push(toolName);
@@ -947,6 +1028,11 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         guard();
         syncToolSurface(ctx);
         guard();
+        if (reconcileFromTranscriptOnInit) {
+          reconcileFromTranscriptOnInit = false;
+          reconcileSearchActivation(nextState);
+          guard();
+        }
         // A connected snapshot is readiness-like external state. Publish it only
         // after Pi's model-facing direct-tool surface reflects live metadata.
         nextState.statusEvents = pi.events;
@@ -975,6 +1061,8 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           for (const name of registeredDuringFinalization) {
             registeredDirectTools.delete(name);
             registeredDirectToolServers.delete(name);
+            registeredDirectToolOriginalNames.delete(name);
+            registeredDirectToolResourceUris.delete(name);
             registeredDirectToolVersions.delete(name);
             registeredNamespaceProxyTools.delete(name);
           }
@@ -1074,6 +1162,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     // Reset before any await so replacement sessions cannot inherit activation.
     searchActivatedTools.clear();
     holdLazyToolsInactive();
+    // Whatever the reason, the transcript is the record of which search-mode
+    // tools this session loaded; reconcile against it once initialized.
+    reconcileFromTranscriptOnInit = true;
     const generation = ++lifecycleGeneration;
     largeDirectToolsAdvisoryDelivered = false;
     const previousState = state;
@@ -1167,6 +1258,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     if (sessionManager !== currentState.sessionManager) return;
 
     restoreCurrentSessionApprovals(currentState);
+    // Navigation changes the active branch: tools loaded on the branch we left
+    // are held again, and the new branch's tools come back.
+    reconcileSearchActivation(currentState);
   });
 
   pi.on("input", async () => {
@@ -1939,7 +2033,30 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
             : proxyModes.executeAuthComplete(proxyState, params.server, input);
         }
         if (params.tool) {
-          return proxyModes.executeCall(proxyState, params.tool, parsedArgs, params.server, getPiTools, signal);
+          const result = await proxyModes.executeCall(proxyState, params.tool, parsedArgs, params.server, getPiTools, signal);
+          if (lazyDirectTools.size === 0) return result;
+          // A proxy call is as clear a signal as a search hit: the model wants
+          // this tool. Activate it additively so the next call gets the real
+          // schema. Lookup failures carry details.error and activate nothing.
+          // A generated resource reader identifies itself by resourceUri.
+          const identity = result.details as { error?: unknown; server?: unknown; tool?: unknown; resourceUri?: unknown } | undefined;
+          if (!identity || identity.error !== undefined || typeof identity.server !== "string") return result;
+          const name = typeof identity.tool === "string"
+            ? lazyToolFor(identity.server, identity.tool)
+            : typeof identity.resourceUri === "string"
+              ? lazyResourceToolFor(identity.server, identity.resourceUri)
+              : undefined;
+          if (!name) return result;
+          assertRuntimeGuard(proxyGuard);
+          holdLazyToolsInactive();
+          const added = activateSearchMatches([{ server: identity.server, tool: name }]);
+          if (added.length === 0) return result;
+          return {
+            ...result,
+            content: [...result.content, { type: "text" as const, text: `Activated as a direct tool: ${name} — call it by name from now on.` }],
+            details: { ...(result.details ?? {}), activated: added },
+            addedToolNames: added,
+          };
         }
         if (params.connect) {
           return connectAndReport(proxyState, params.connect, signal, _ctx as ExtensionContext);
