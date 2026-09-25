@@ -3985,8 +3985,9 @@ describe("directTools: \"search\" — registered inactive, activated by search o
     const result = await proxyTool.execute("call-1", { tool: "demo_alpha", args: {} });
     expect(activeTools()).toEqual(["bash", "mcp", "demo_alpha"]);
     expect(result.addedToolNames).toEqual(["demo_alpha"]);
-    expect(result.content[0].text).toContain("Activated as a direct tool: demo_alpha");
-    expect(result.content[1].text).toBe("ok"); // the call's own output is kept
+    // The call's output comes back untouched (already sized to the output limits).
+    expect(result.content).toEqual([{ type: "text", text: "ok" }]);
+    expect(result.details.activated).toEqual(["demo_alpha"]);
     // Calling an already-active tool through the proxy changes nothing.
     const again = await proxyTool.execute("call-2", { tool: "demo_alpha", args: {} });
     expect(again.addedToolNames).toBeUndefined();

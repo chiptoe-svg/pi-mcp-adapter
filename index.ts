@@ -1949,12 +1949,10 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           holdLazyToolsInactive();
           const added = activateSearchMatches([{ server: identity.server, tool: identity.canonicalTool }]);
           if (added.length === 0) return result;
-          return {
-            ...result,
-            content: [{ type: "text" as const, text: `Activated as a direct tool: ${added[0]} — call it by name from now on.` }, ...result.content],
-            details: { ...(result.details ?? {}), activated: added },
-            addedToolNames: added,
-          };
+          // Content is returned untouched: the call's output is already sized to
+          // the output limits and is what a compact view previews. The tool
+          // description tells the model a called tool is direct from then on.
+          return { ...result, details: { ...(result.details ?? {}), activated: added }, addedToolNames: added };
         }
         if (params.connect) {
           return connectAndReport(proxyState, params.connect, signal, _ctx as ExtensionContext);
